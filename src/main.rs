@@ -559,18 +559,10 @@ fn apply_placement(state: &State, ext_key: &str, win: &WindowSnap, force: bool) 
         }
     }
 
-    if win.maximized && !entry.data.states.contains(&TL_STATE_MAXIMIZED) {
-        mgr.set_maximized(cosmic);
-    }
-    if win.fullscreen && !entry.data.states.contains(&TL_STATE_FULLSCREEN) {
-        mgr.set_fullscreen(cosmic, output);
-    }
-    if win.sticky && !entry.data.states.contains(&TL_STATE_STICKY) && mgr.version() >= 3 {
-        mgr.set_sticky(cosmic);
-    }
-    if win.minimized && !entry.data.states.contains(&TL_STATE_MINIMIZED) {
-        mgr.set_minimized(cosmic);
-    }
+    // Estados (fullscreen/maximizado/etc.) NO se restauran a propósito:
+    // set_fullscreen sobre un output fullscreenea en el workspace activo y
+    // arrastra la ventana fuera de donde la acabamos de colocar. El autotiling
+    // del workspace se encarga del acomodo.
 
     let note = if placed_in != win.workspace {
         format!(" (destino {:?} no existe)", win.workspace.as_deref().unwrap_or("?"))

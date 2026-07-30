@@ -104,7 +104,42 @@ pub fn desktop_file_for(app_id: &str) -> Option<PathBuf> {
     None
 }
 
-fn spawn_detached(cmd: &mut Command) -> std::io::Result<()> {
+fn have_systemd_run() -> bool {
+    Command::new("systemd-run")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// Línea Exec= del .desktop, sin los field codes (%u, %F, ...).
+fn exec_from_desktop(path: &std::path::Path) -> Option<String> {
+    let txt = std::fs::read_to_string(path).ok()?;
+    let exec = txt
+        .lines()
+        .find_map(|l| l.strip_prefix("Exec="))?
+        .split_whitespace()
+        .filter(|tok| !tok.starts_with('%'))
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!exec.is_empty()).then_some(exec)
+}
+
+/// Ejecuta `sh -c "exec <cmdline>"` en su propia unidad systemd, para que NO
+/// quede en el cgroup de la terminal: si no, al cerrar la terminal que corrió
+/// `restore`, systemd limpia el scope entero y se cierra todo lo restaurado.
+fn spawn_detached(cmdline: &str) -> std::io::Result<()> {
+    let sh_arg = format!("exec {cmdline}");
+    let mut cmd = if have_systemd_run() {
+        let mut c = Command::new("systemd-run");
+        c.args(["--user", "--collect", "--quiet", "sh", "-c", &sh_arg]);
+        c
+    } else {
+        let mut c = Command::new("sh");
+        c.args(["-c", &sh_arg]);
+        c
+    };
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -121,23 +156,25 @@ pub enum Launch {
 }
 
 impl Launch {
+    fn cmdline(&self) -> String {
+        match self {
+            Launch::Desktop(p) => exec_from_desktop(p)
+                .unwrap_or_else(|| format!("gio launch '{}'", p.display())),
+            Launch::BrowserProfile { binary, profile } => {
+                format!("{binary} \"--profile-directory={profile}\"")
+            }
+            Launch::RawCommand(c) => format!("'{c}'"),
+        }
+    }
+
     pub fn describe(&self) -> String {
         match self {
-            Launch::Desktop(p) => format!("gio launch {}", p.display()),
-            Launch::BrowserProfile { binary, profile } => {
-                format!("{binary} --profile-directory=\"{profile}\"")
-            }
-            Launch::RawCommand(c) => c.clone(),
+            Launch::Desktop(p) => format!("{}  [{}]", self.cmdline(), p.display()),
+            _ => self.cmdline(),
         }
     }
 
     pub fn spawn(&self) -> std::io::Result<()> {
-        match self {
-            Launch::Desktop(p) => spawn_detached(Command::new("gio").arg("launch").arg(p)),
-            Launch::BrowserProfile { binary, profile } => spawn_detached(
-                Command::new(binary).arg(format!("--profile-directory={profile}")),
-            ),
-            Launch::RawCommand(c) => spawn_detached(&mut Command::new(c)),
-        }
+        spawn_detached(&self.cmdline())
     }
 }

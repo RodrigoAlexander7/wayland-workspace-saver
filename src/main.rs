@@ -189,29 +189,32 @@ fn cmd_restore(args: &[String]) {
         .clone()
         .expect("falta ext_workspace_manager_v1");
 
-    // ---- 1. workspaces: crear los que falten, luego tiling y pin
-    let missing: Vec<WorkspaceSnap> = snap
+    // ---- 1. workspaces: solo se pueden crear por adelantado los fijados.
+    // COSMIC maneja los demás dinámicamente (no permite dos vacíos seguidos):
+    // se crean solos cuando el anterior se puebla, así que los destinos
+    // dinámicos se resuelven en cascada durante el loop de emparejamiento.
+    let missing_pinned: Vec<WorkspaceSnap> = snap
         .workspaces
         .iter()
-        .filter(|w| state.workspace_by_name(&w.name).is_none())
+        .filter(|w| w.pinned && state.workspace_by_name(&w.name).is_none())
         .cloned()
         .collect();
-    if !missing.is_empty() && !dry_run {
-        for w in &missing {
+    if !missing_pinned.is_empty() && !dry_run {
+        for w in &missing_pinned {
             let group = w
                 .output
                 .as_ref()
                 .and_then(|o| state.groups.values().find(|(_, outs)| outs.contains(o)))
                 .or_else(|| state.groups.values().next());
             if let Some((g, _)) = group {
-                println!("creando workspace {:?}", w.name);
+                println!("creando workspace fijado {:?}", w.name);
                 g.create_workspace(w.name.clone());
             }
         }
         ws_mgr.commit();
         let deadline = Instant::now() + Duration::from_secs(3);
         while Instant::now() < deadline
-            && missing
+            && missing_pinned
                 .iter()
                 .any(|w| state.workspace_by_name(&w.name).is_none())
         {
@@ -221,35 +224,11 @@ fn cmd_restore(args: &[String]) {
         }
     }
 
+    // tiling/pin de los workspaces ya presentes; los dinámicos que aparezcan
+    // durante el loop se configuran ahí mismo
+    let mut ws_configured: HashSet<String> = HashSet::new();
     if !dry_run {
-        let mut dirty = false;
-        for w in &snap.workspaces {
-            let Some(entry) = state.workspace_by_name(&w.name) else {
-                eprintln!("[aviso] no se pudo crear el workspace {:?}", w.name);
-                continue;
-            };
-            if let (Some(cosmic), Some(t)) = (&entry.cosmic, w.tiling) {
-                if entry.data.tiling != Some(t) {
-                    let ts = if t == 1 {
-                        TilingState::TilingEnabled
-                    } else {
-                        TilingState::FloatingOnly
-                    };
-                    cosmic.set_tiling_state(ts);
-                    dirty = true;
-                }
-            }
-            if w.pinned && entry.data.cosmic_state & WS_COSMIC_PINNED == 0 {
-                if let Some(cosmic) = &entry.cosmic {
-                    cosmic.pin();
-                    dirty = true;
-                }
-            }
-        }
-        if dirty {
-            ws_mgr.commit();
-            queue.roundtrip(&mut state).unwrap();
-        }
+        apply_workspace_settings(&mut state, &snap, &mut ws_configured, &ws_mgr, &mut queue);
     }
 
     // ---- 2. lanzar aplicaciones que falten
@@ -291,19 +270,28 @@ fn cmd_restore(args: &[String]) {
                 });
             }
         } else if let Some(desktop) = launch::desktop_file_for(app_id) {
-            launches.push(launch::Launch::Desktop(desktop));
+            // un lanzamiento por ventana faltante (p. ej. 2 terminales)
+            for _ in 0..(saved_n - live_n) {
+                launches.push(launch::Launch::Desktop(desktop.clone()));
+            }
         } else {
             eprintln!("[aviso] sin .desktop para {app_id:?}; intento ejecutarlo directo");
             launches.push(launch::Launch::RawCommand(app_id.clone()));
         }
     }
     launches.sort();
-    launches.dedup();
 
     if dry_run {
         println!("== PLAN (dry-run) ==");
-        for w in &missing {
-            println!("  crear workspace {:?}", w.name);
+        for w in &missing_pinned {
+            println!("  crear workspace fijado {:?}", w.name);
+        }
+        for w in snap
+            .workspaces
+            .iter()
+            .filter(|w| !w.pinned && state.workspace_by_name(&w.name).is_none())
+        {
+            println!("  workspace {:?}: se creará en cascada al poblar los anteriores", w.name);
         }
         for l in &launches {
             println!("  lanzar: {}", l.describe());
@@ -341,10 +329,13 @@ fn cmd_restore(args: &[String]) {
         wayland::pump_cosmic(&mut state, &qh);
         queue.roundtrip(&mut state).unwrap();
 
+        // configurar workspaces dinámicos que hayan aparecido en cascada
+        apply_workspace_settings(&mut state, &snap, &mut ws_configured, &ws_mgr, &mut queue);
+
         let force = Instant::now() >= force_at;
         let pairs = match_pass(&state, &slots, &matched_live, force);
         for (ext_key, slot_idx) in pairs {
-            if apply_placement(&state, &ext_key, &slots[slot_idx].win) {
+            if apply_placement(&state, &ext_key, &slots[slot_idx].win, force) {
                 slots[slot_idx].matched = true;
                 matched_live.insert(ext_key);
             }
@@ -373,6 +364,47 @@ fn cmd_restore(args: &[String]) {
     }
 }
 
+/// Aplica tiling y pin a los workspaces del snapshot que ya existen en vivo
+/// y aún no fueron configurados. Se llama también dentro del loop porque los
+/// workspaces dinámicos van apareciendo en cascada.
+fn apply_workspace_settings(
+    state: &mut State,
+    snap: &SessionSnapshot,
+    configured: &mut HashSet<String>,
+    ws_mgr: &wayland_protocols::ext::workspace::v1::client::ext_workspace_manager_v1::ExtWorkspaceManagerV1,
+    queue: &mut wayland_client::EventQueue<State>,
+) {
+    let mut dirty = false;
+    for w in &snap.workspaces {
+        if configured.contains(&w.name) {
+            continue;
+        }
+        let Some(entry) = state.workspace_by_name(&w.name) else { continue };
+        if let (Some(cosmic), Some(t)) = (&entry.cosmic, w.tiling) {
+            if entry.data.tiling != Some(t) {
+                let ts = if t == 1 {
+                    TilingState::TilingEnabled
+                } else {
+                    TilingState::FloatingOnly
+                };
+                cosmic.set_tiling_state(ts);
+                dirty = true;
+            }
+        }
+        if w.pinned && entry.data.cosmic_state & WS_COSMIC_PINNED == 0 {
+            if let Some(cosmic) = &entry.cosmic {
+                cosmic.pin();
+                dirty = true;
+            }
+        }
+        configured.insert(w.name.clone());
+    }
+    if dirty {
+        ws_mgr.commit();
+        queue.roundtrip(state).unwrap();
+    }
+}
+
 /// Empareja ventanas vivas sin asignar con slots guardados del mismo app_id:
 /// título exacto > substring > candidato único > (en modo force) por orden.
 fn match_pass(
@@ -396,6 +428,16 @@ fn match_pass(
     let mut pairs: Vec<(String, usize)> = Vec::new();
     let mut used: HashSet<String> = HashSet::new();
 
+    // el workspace destino todavía no existe (COSMIC lo creará en cascada):
+    // no emparejar aún, salvo en modo force donde hay fallback de destino
+    let blocked = |win: &WindowSnap| -> bool {
+        !force
+            && win
+                .workspace
+                .as_deref()
+                .is_some_and(|n| state.workspace_by_name(n).is_none())
+    };
+
     fn find_candidate(
         win: &WindowSnap,
         live: &HashMap<&str, Vec<&String>>,
@@ -415,6 +457,9 @@ fn match_pass(
             continue;
         }
         let win = &slots[idx].win;
+        if blocked(win) {
+            continue;
+        }
         if let Some(k) = find_candidate(win, &live, &live_keys, &used, &|a, b| a == b) {
             used.insert(k.clone());
             pairs.push((k, idx));
@@ -426,6 +471,9 @@ fn match_pass(
             continue;
         }
         let win = &slots[idx].win;
+        if blocked(win) {
+            continue;
+        }
         if let Some(k) = find_candidate(win, &live, &live_keys, &used, &|a, b| {
             a.len() >= 8 && b.len() >= 8 && (a.contains(b) || b.contains(a))
         }) {
@@ -439,6 +487,9 @@ fn match_pass(
             continue;
         }
         let win = &slots[idx].win;
+        if blocked(win) {
+            continue;
+        }
         let free: Vec<&String> = live
             .get(win.app_id.as_str())
             .map(|v| v.iter().filter(|k| !used.contains(**k)).copied().collect())
@@ -463,7 +514,7 @@ fn match_pass(
 
 /// Mueve la ventana a su workspace y restaura sus estados.
 /// Devuelve false si aún no se puede aplicar (reintentar en la siguiente vuelta).
-fn apply_placement(state: &State, ext_key: &str, win: &WindowSnap) -> bool {
+fn apply_placement(state: &State, ext_key: &str, win: &WindowSnap, force: bool) -> bool {
     let Some(entry) = state.toplevels.get(ext_key) else { return false };
     let Some(cosmic) = &entry.cosmic else { return false };
     let Some(mgr) = &state.toplevel_mgr else { return false };
@@ -474,16 +525,33 @@ fn apply_placement(state: &State, ext_key: &str, win: &WindowSnap) -> bool {
         .and_then(|o| state.output_by_name(o))
         .or_else(|| state.any_output());
 
+    let mut placed_in = win.workspace.clone();
     if let Some(ws_name) = &win.workspace {
+        let target = state.workspace_by_name(ws_name).or_else(|| {
+            if force {
+                // el destino nunca llegó a existir: mejor el último workspace
+                // (el vacío final que COSMIC mantiene) que dejarla donde cayó
+                let last = state
+                    .workspaces
+                    .values()
+                    .max_by(|a, b| a.data.coordinates.cmp(&b.data.coordinates));
+                placed_in = last.map(|w| w.data.name.clone());
+                last
+            } else {
+                None
+            }
+        });
+        let Some(ws) = target else { return false };
+
         // si ya está donde debe, no lo movemos
         let already = entry
             .data
             .workspaces
             .iter()
             .filter_map(|k| state.workspaces.get(k))
-            .any(|w| &w.data.name == ws_name);
+            .any(|w| w.data.name == ws.data.name);
         if !already {
-            if let (Some(ws), Some(out)) = (state.workspace_by_name(ws_name), output) {
+            if let Some(out) = output {
                 if mgr.version() >= 4 {
                     mgr.move_to_ext_workspace(cosmic, &ws.ext, out);
                 }
@@ -504,11 +572,16 @@ fn apply_placement(state: &State, ext_key: &str, win: &WindowSnap) -> bool {
         mgr.set_minimized(cosmic);
     }
 
+    let note = if placed_in != win.workspace {
+        format!(" (destino {:?} no existe)", win.workspace.as_deref().unwrap_or("?"))
+    } else {
+        String::new()
+    };
     println!(
-        "  ✓ {} — {:?} -> workspace {:?}",
+        "  ✓ {} — {:?} -> workspace {:?}{note}",
         win.app_id,
         win.title,
-        win.workspace.as_deref().unwrap_or("?")
+        placed_in.as_deref().unwrap_or("?")
     );
     true
 }

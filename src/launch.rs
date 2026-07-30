@@ -79,6 +79,28 @@ pub fn desktop_file_for(app_id: &str) -> Option<PathBuf> {
             }
         }
     }
+    // último recurso: apps cuyo app_id no coincide con el nombre del archivo
+    // (p. ej. AppImages); buscar por StartupWMClass y luego por Name
+    for key in ["StartupWMClass", "Name"] {
+        for d in &dirs {
+            let Ok(entries) = std::fs::read_dir(d) else { continue };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().is_none_or(|e| e != "desktop") {
+                    continue;
+                }
+                let Ok(txt) = std::fs::read_to_string(&path) else { continue };
+                let hit = txt.lines().any(|l| {
+                    l.strip_prefix(key)
+                        .and_then(|r| r.trim_start().strip_prefix('='))
+                        .is_some_and(|v| v.trim().eq_ignore_ascii_case(app_id))
+                });
+                if hit {
+                    return Some(path);
+                }
+            }
+        }
+    }
     None
 }
 
